@@ -1,6 +1,7 @@
 ### OSM4EO LULC classficaiton with deep residual convolutional neural networks
 
-existing models: https://1drv.ms/f/s!AsaD57Gg8TWIlfFvgtTjDT6E0067Jg?e=kkmekb 
+- Extract OSM objects download for https://doi.org/10.11588/data/IUTCDN  and visualization at https://osmlanduse.org and here https://heigit.org/tag/osmlanduse-en/
+- existing models: https://1drv.ms/f/s!AsaD57Gg8TWIlfFvgtTjDT6E0067Jg?e=kkmekb 
 
 This is the source code repo for the deep learning method within OSM4EO work.
 
