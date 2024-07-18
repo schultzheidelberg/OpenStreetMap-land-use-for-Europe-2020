@@ -1,5 +1,7 @@
 ### OSM4EO LULC classficaiton with deep residual convolutional neural networks
 
+existing models: https://1drv.ms/f/s!AsaD57Gg8TWIlfFvgtTjDT6E0067Jg?e=kkmekb 
+
 This is the source code repo for the deep learning method within OSM4EO work.
 
 To be noticed, all the code was designed for bwcluster GPU server with python packages and environment on Anaconda. 
