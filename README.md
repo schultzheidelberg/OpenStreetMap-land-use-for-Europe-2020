@@ -94,5 +94,6 @@ $ msub bwcluster_bash_job.sh
 
 ## Related work:
 
-Li, H.; Ghamisi, P.; Rasti, B.; Wu, Z.; Shapiro, A.; Schultz, M.; Zipf, A. A Multi-Sensor Fusion Framework Based on Coupled Residual Convolutional Neural Networks. Remote Sens. 2020, 12, 2067. https://doi.org/10.3390/rs12122067
+OSMlanduse a dataset of European Union land use at 10 m resolution derived from OpenStreetMap and Sentinel-2
+https://www.nature.com/articles/s41597-025-04703-8
 
