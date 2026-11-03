@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    env:
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      GDAL_NUM_THREADS: "1"
+      GDAL_CACHEMAX: "256"
+      TF_NUM_INTRAOP_THREADS: "1"
+      TF_NUM_INTEROP_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the matching system GDAL bindings
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gdal python3-venv
+          /usr/bin/python3 -m venv --system-site-packages .venv
+      - name: Install test and model dependencies
+        run: .venv/bin/python -m pip install -r requirements-dev.txt -r requirements-training.txt -r requirements-database.txt
+      - name: Lint and check formatting
+        run: |
+          .venv/bin/ruff check .
+          .venv/bin/ruff format --check .
+      - name: Test with synthetic data
+        run: .venv/bin/python -m pytest

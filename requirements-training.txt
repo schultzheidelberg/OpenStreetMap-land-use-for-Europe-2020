@@ -1,0 +1,2 @@
+-r requirements.txt
+tensorflow-cpu==2.15.1
