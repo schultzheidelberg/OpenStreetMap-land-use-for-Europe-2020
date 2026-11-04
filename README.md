@@ -56,7 +56,7 @@ python 02_keras_models_single.py \
   --depth 29 --epochs 600 --batch-size 256 --seed 42
 ```
 
-Training retains the original ResNet architecture and **13 output indices (0–12)**. Classes 1–12 are land-use classes; index 0 remains reserved. The default learning rate is fixed at 0.01, matching the original effective behavior. `--learning-rate-schedule` enables the previously defined but unused schedule. The best validation checkpoint is saved to the requested model path.
+Training retains the original ResNet architecture and **13 output indices (0–12)**. Classes 1–12 are land-use classes; index 0 remains reserved. The default learning rate is fixed at 0.01, matching the original effective behavior. `--learning-rate-schedule` enables the previously defined but unused schedule. The best validation checkpoint is saved to the requested model path only after checking its weights and validation scores for non-finite values. A failed check preserves any previous output. Use a lowercase `.keras` or `.h5` suffix; unsupported capitalization is rejected before training.
 
 Old object-array `.npy` samples are supported only with `--allow-legacy-pickle`. Use that option exclusively for files you trust; pickle can execute code. Training loads the selected samples into memory. The Moab job template `bwcluster_bash_job.sh` accepts the same arguments; configure the cluster environment and resource request before submitting it.
 
@@ -70,14 +70,16 @@ python 03_keras_classification.py \
   --batch-size 256 --window-size 128
 ```
 
-Prediction reads the raster in windows, uses bounded patch batches, and writes one-band `uint16` class IDs on the source grid. Invalid source pixels become output nodata 0. The model's band count, patch dimensions, and output classes are checked before publishing the result.
+Prediction reads the raster in windows, uses bounded patch batches, and writes one-band `uint16` class IDs on the source grid. Invalid source pixels become output nodata 0. The model's band count, patch dimensions, and output classes are checked before publishing the result. Load only models from sources you trust: Keras model files are executable model definitions, not plain numeric sample archives.
+
+Keras prediction uses `predict_on_batch` to avoid setting up a prediction iterator repeatedly. `--batch-size` is the actual model batch size. Lower it if model activation memory is constrained; earlier `predict()` calls internally split batches into 32 patches even when the outer batch was larger. This optimization has been checked on small CPU fixtures, not benchmarked on the full Europe dataset.
 
 **Numerical changes to understand when comparing old results:**
 
 - Training and prediction now share the same patch layout: a 12×12 patch places its target pixel at index 5, with normalized zero padding at image edges. The original inference used index 6 and symmetric padding, causing a one-pixel offset from training.
 - `--legacy-patches` restores that old inference layout for comparisons with existing models. It does not reproduce the old pipeline bit for bit.
 - Global min/max normalization now excludes masked and non-finite values. It uses one pair of extrema across the raster's bands, preserving the original global scaling convention. Constant valid images retain their values.
-- Sampling no longer duplicates centers across the training and validation sets. Existing models remain loadable, but retraining and resulting accuracy may differ. Synthetic tests do not establish equivalence to the published dataset or validate published model accuracy.
+- Sampling no longer duplicates centers across the training and validation sets. The original architecture and output numbering are retained; save/reload tests cover newly generated `.keras` and `.h5` models. Downloaded historical weights have not been tested and must be validated before reuse. Retraining and resulting accuracy may differ. Synthetic tests do not establish equivalence to the published dataset or validate published model accuracy.
 
 ## Postprocess
 
@@ -104,6 +106,8 @@ python 09_post_clip_geojson.py results/mosaic.tif data/boundary.geojson results/
 ```
 
 GeoJSON geometry is transformed to the raster CRS; use `--geometry-crs` if the file uses another CRS. Mosaics preserve class values and reject incompatible grids. Sieve uses GDAL's connected-region processing: its bookkeeping can grow with the number of regions even though pixels are not read into a whole-image NumPy array.
+
+Postprocessing retains explicit validity masks inside the TIFF, including valid pixels whose stored value is zero or equals the declared nodata value. Mosaics use the first **valid** input pixel, independently of its value, and mask gaps between tiles. Read these outputs with mask-aware GIS tools (for example `read(masked=True)` in Rasterio). Mosaicking uses bounded 512-pixel windows and opens one source at a time; continent-scale throughput remains unmeasured.
 
 The class mapping is:
 
@@ -145,6 +149,8 @@ ruff format --check .
 Tests create tiny temporary rasters and geometries. They cover patch alignment, sampling splits, nodata, class remapping, grid validation, mosaics, clipping, output protection, database-export helpers, and command help/import behavior. With TensorFlow installed they also build and reload a small ResNet, and run one training epoch through the preparation → training → prediction commands on a tiny synthetic raster. Model tests are skipped when TensorFlow is absent. GitHub Actions installs the CPU model dependencies to run those checks.
 
 Use one worker and one library thread initially on a shared server. Raster operations set a 256 MiB GDAL cache; that is **not** a total process-memory limit. On the shared WBEO host, use the existing `raster-run` wrapper for real processing jobs. Do not run a continent-wide job merely to test installation.
+
+The [Dev Gang review record](docs/dev-gang-review.md) documents the additional correctness fixes, independent checks, and remaining validation limits.
 
 ## License
 

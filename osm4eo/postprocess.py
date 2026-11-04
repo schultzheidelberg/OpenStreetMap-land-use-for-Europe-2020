@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from rasterio.features import geometry_mask, geometry_window
-from rasterio.merge import merge
 from rasterio.warp import transform_geom
 from rasterio.windows import Window
 
@@ -53,6 +52,7 @@ def _profile(dataset, *, nodata=None):
 
 
 def _background(dataset):
+    """Return a storage fill value; validity is recorded separately in the mask."""
     return dataset.nodata if dataset.nodata is not None else 0
 
 
@@ -63,16 +63,17 @@ def extract_lu(input_path, output_path, class_id, *, overwrite=False):
             _check_classification(source)
             limits = np.iinfo(source.dtypes[0])
             nodata = _background(source)
-            if not limits.min <= class_id <= limits.max or class_id == nodata:
-                raise ValueError("class_id must be representable and different from nodata")
+            if not limits.min <= class_id <= limits.max:
+                raise ValueError("class_id must be representable in the source dtype")
             with atomic_raster_output([input_path], output_path, overwrite=overwrite) as temporary:
-                with rasterio.open(temporary, "w", **_profile(source, nodata=nodata)) as target:
+                with rasterio.open(temporary, "w", **_profile(source)) as target:
                     for window in _windows(source.width, source.height):
                         data = source.read(1, window=window, masked=True)
                         keep = (data.data == class_id) & ~np.ma.getmaskarray(data)
                         target.write(
                             np.where(keep, data.data, nodata).astype(data.dtype), 1, window=window
                         )
+                        target.write_mask(keep, window=window)
 
 
 def clip_extent(input_path, mask_path, output_path, *, mask_value=1, overwrite=False):
@@ -92,7 +93,7 @@ def clip_extent(input_path, mask_path, output_path, *, mask_value=1, overwrite=F
             with atomic_raster_output(
                 [input_path, mask_path], output_path, overwrite=overwrite
             ) as temporary:
-                with rasterio.open(temporary, "w", **_profile(source, nodata=nodata)) as target:
+                with rasterio.open(temporary, "w", **_profile(source)) as target:
                     for window in _windows(source.width, source.height):
                         data = source.read(1, window=window, masked=True)
                         mask_data = mask.read(1, window=window, masked=True)
@@ -104,6 +105,7 @@ def clip_extent(input_path, mask_path, output_path, *, mask_value=1, overwrite=F
                         target.write(
                             np.where(keep, data.data, nodata).astype(data.dtype), 1, window=window
                         )
+                        target.write_mask(keep, window=window)
 
 
 def transfer_labels(input_path, output_path, *, overwrite=False):
@@ -111,7 +113,7 @@ def transfer_labels(input_path, output_path, *, overwrite=False):
     with rasterio.Env(GDAL_CACHEMAX=GDAL_CACHE_BYTES, GDAL_NUM_THREADS="1"):
         with rasterio.open(input_path) as source:
             _check_classification(source)
-            nodata = _background(source)
+            nodata = source.nodata
             # A nodata marker cannot also identify a valid output class.
             if nodata in CLASS_TO_OSM.values():
                 nodata = 0
@@ -122,8 +124,10 @@ def transfer_labels(input_path, output_path, *, overwrite=False):
                         result = data.data.copy()
                         for model_class, osm_class in CLASS_TO_OSM.items():
                             result[data.data == model_class] = osm_class
-                        result[np.ma.getmaskarray(data)] = nodata
+                        valid = ~np.ma.getmaskarray(data)
+                        result[~valid] = nodata if nodata is not None else 0
                         target.write(result, 1, window=window)
+                        target.write_mask(valid, window=window)
 
 
 @contextmanager
@@ -183,17 +187,19 @@ def sieve_raster(input_path, output_path, size=64, *, connectivity=8, overwrite=
 
 
 def merge_extents(input_paths, output_path, *, overwrite=False):
-    """Mosaic aligned integer tiles, preserving dtype and first-input priority."""
+    """Mosaic aligned integer tiles in bounded windows, using first-valid priority."""
     input_paths = list(input_paths)
     if not input_paths:
         raise ValueError("At least one input raster is required")
     with rasterio.Env(GDAL_CACHEMAX=GDAL_CACHE_BYTES, GDAL_NUM_THREADS="1"):
         with rasterio.open(input_paths[0]) as first:
             _check_classification(first)
-            profile = _profile(first, nodata=_background(first))
+            profile = _profile(first)
+            background = _background(first)
             reference_crs, reference_transform = first.crs, first.transform
             reference_dtype = first.dtypes[0]
             reference_nodata = first.nodata
+        tiles = []
         for path in input_paths:
             with rasterio.open(path) as source:
                 _check_classification(source)
@@ -218,17 +224,59 @@ def merge_extents(input_paths, output_path, *, overwrite=False):
                 )
                 if any(not np.isclose(value, round(value), atol=1e-7, rtol=0) for value in offsets):
                     raise ValueError("Mosaic inputs must lie on the same pixel grid")
+                column, row = (round(value) for value in offsets)
+                tiles.append((path, column, row, source.width, source.height))
+        left = min(column for _, column, _, _, _ in tiles)
+        top = min(row for _, _, row, _, _ in tiles)
+        width = max(column + width for _, column, _, width, _ in tiles) - left
+        height = max(row + height for _, _, row, _, height in tiles) - top
+        profile.update(
+            width=width,
+            height=height,
+            transform=rasterio.windows.transform(
+                Window(left, top, width, height), reference_transform
+            ),
+        )
         with atomic_raster_output(input_paths, output_path, overwrite=overwrite) as temporary:
-            merge(
-                input_paths,
-                indexes=[1],
-                nodata=profile["nodata"],
-                dtype=reference_dtype,
-                method="first",
-                dst_path=temporary,
-                dst_kwds=profile,
-                mem_limit=64,
-            )
+            with rasterio.open(temporary, "w", **profile) as target:
+                for window in _windows(width, height):
+                    result = np.full(
+                        (int(window.height), int(window.width)), background, dtype=reference_dtype
+                    )
+                    occupied = np.zeros(result.shape, dtype=bool)
+                    for path, column, row, tile_width, tile_height in tiles:
+                        column, row = column - left, row - top
+                        start_column = max(int(window.col_off), column)
+                        start_row = max(int(window.row_off), row)
+                        end_column = min(int(window.col_off + window.width), column + tile_width)
+                        end_row = min(int(window.row_off + window.height), row + tile_height)
+                        if start_column >= end_column or start_row >= end_row:
+                            continue
+                        source_window = Window(
+                            start_column - column,
+                            start_row - row,
+                            end_column - start_column,
+                            end_row - start_row,
+                        )
+                        rows = slice(start_row - int(window.row_off), end_row - int(window.row_off))
+                        columns = slice(
+                            start_column - int(window.col_off), end_column - int(window.col_off)
+                        )
+                        region = result[rows, columns]
+                        region_occupied = occupied[rows, columns]
+                        if region_occupied.all():
+                            continue
+                        with rasterio.open(path) as source:
+                            data = source.read(1, window=source_window, masked=True)
+                        # A class value can equal the declared nodata when an
+                        # explicit mask marks it valid. Track coverage separately.
+                        take = ~region_occupied & ~np.ma.getmaskarray(data)
+                        region[take] = data.data[take]
+                        region_occupied |= take
+                        if occupied.all():
+                            break
+                    target.write(result, 1, window=window)
+                    target.write_mask(occupied, window=window)
 
 
 def _read_geometries(path, geometry_crs):
@@ -264,7 +312,7 @@ def clip_geojson(input_path, geometry_path, output_path, *, geometry_crs=None, o
             except rasterio.errors.WindowError as error:
                 raise ValueError("GeoJSON geometries do not overlap the raster") from error
             nodata = _background(source)
-            profile = _profile(source, nodata=nodata)
+            profile = _profile(source)
             profile.update(
                 width=int(crop.width),
                 height=int(crop.height),
@@ -292,6 +340,7 @@ def clip_geojson(input_path, geometry_path, output_path, *, geometry_crs=None, o
                         target.write(
                             np.where(keep, data.data, nodata).astype(data.dtype), 1, window=window
                         )
+                        target.write_mask(keep, window=window)
 
 
 def main(operation, argv=None):

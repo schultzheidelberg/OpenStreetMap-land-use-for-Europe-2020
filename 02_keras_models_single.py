@@ -188,8 +188,8 @@ def classification_metrics(labels, predicted):
 def train_model(args):
     """Train only when explicitly invoked; preserve existing output by default."""
     output = Path(args.output_model)
-    if output.suffix.lower() not in {".keras", ".h5"}:
-        raise ValueError("Output model must end in .keras or .h5")
+    if output.suffix not in {".keras", ".h5"}:
+        raise ValueError("Output model must end in lowercase .keras or .h5")
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"Output already exists: {output}")
     if output.resolve() in {Path(args.train).resolve(), Path(args.validation).resolve()}:
@@ -262,10 +262,16 @@ def train_model(args):
             validation_data=(x_validation, keras.utils.to_categorical(y_validation, 13)),
         )
         best_model = keras.models.load_model(checkpoint_path, compile=False)
+        # Optimized prediction graphs can mask non-finite weights behind finite
+        # scores. Check one tensor at a time before accepting the checkpoint.
+        for weight in best_model.weights:
+            if not np.isfinite(weight.numpy()).all():
+                raise ValueError("Best model contains non-finite weights; training diverged")
         start = time.monotonic()
-        predicted = np.argmax(
-            best_model.predict(x_validation, batch_size=args.batch_size, verbose=0), axis=1
-        )
+        scores = np.asarray(best_model.predict(x_validation, batch_size=args.batch_size, verbose=0))
+        if scores.shape != (len(x_validation), 13) or not np.isfinite(scores).all():
+            raise ValueError("Best model must return finite validation scores with shape (N, 13)")
+        predicted = np.argmax(scores, axis=1)
         elapsed = time.monotonic() - start
         final_path = Path(temporary) / output.name
         best_model.save(final_path)

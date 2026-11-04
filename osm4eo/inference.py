@@ -44,6 +44,15 @@ def _validate_model_shape(model, patch_size, bands):
             raise ValueError(f"Model input shape {shape} does not match patches {expected}")
 
 
+def _predict_batch(model, patches):
+    """Use the model's batch API without setting up a predict iterator each time."""
+    predict_on_batch = getattr(model, "predict_on_batch", None)
+    if callable(predict_on_batch):
+        return np.asarray(predict_on_batch(patches))
+    # Retain the small predict-only protocol used by custom predictors.
+    return np.asarray(model.predict(patches, verbose=0))
+
+
 def _read_window(source, window, minimum, maximum, left, right, legacy_patches):
     """Read only a tile and its halo, preserving the global image boundary."""
     row, col = int(window.row_off), int(window.col_off)
@@ -135,7 +144,7 @@ def classify_raster(
                                 patches[index] = image[
                                     row : row + patch_size, col : col + patch_size
                                 ]
-                            scores = np.asarray(model.predict(patches, verbose=0))
+                            scores = _predict_batch(model, patches)
                             if scores.shape != (len(selected), 13) or not np.isfinite(scores).all():
                                 raise ValueError(
                                     "The model must return finite scores with shape (batch, 13)"

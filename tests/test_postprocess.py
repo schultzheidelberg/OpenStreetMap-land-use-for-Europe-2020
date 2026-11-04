@@ -11,7 +11,7 @@ from rasterio.warp import transform_geom
 from osm4eo import postprocess
 
 
-def write_raster(path, values, *, transform=None, crs="EPSG:3035", nodata=0):
+def write_raster(path, values, *, transform=None, crs="EPSG:3035", nodata=0, mask=None):
     values = np.asarray(values)
     with rasterio.open(
         path,
@@ -26,6 +26,8 @@ def write_raster(path, values, *, transform=None, crs="EPSG:3035", nodata=0):
         nodata=nodata,
     ) as target:
         target.write(values, 1)
+        if mask is not None:
+            target.write_mask(np.asarray(mask, dtype="uint8"))
     return path
 
 
@@ -203,3 +205,87 @@ def test_postprocessing_never_overwrites_input_or_existing_output(tmp_path):
         postprocess.extract_lu(source, output, 1)
     assert source.read_bytes() == before
     assert output.read_text() == "keep me"
+
+
+@pytest.mark.parametrize("nodata", [None, 0])
+@pytest.mark.parametrize("operation", ["extract", "mask", "geojson", "labels"])
+def test_postprocessing_preserves_valid_zero_and_explicit_mask(tmp_path, nodata, operation):
+    source = write_raster(
+        tmp_path / "input.tif",
+        np.array([[0, 1, 2]], dtype="uint8"),
+        nodata=nodata,
+        mask=[[255, 255, 0]],
+        crs="EPSG:4326",
+        transform=from_origin(0, 1, 1, 1),
+    )
+    output = tmp_path / "output.tif"
+    if operation == "extract":
+        postprocess.extract_lu(source, output, 0)
+    elif operation == "mask":
+        mask = write_raster(
+            tmp_path / "mask.tif",
+            np.ones((1, 3), dtype="uint8"),
+            crs="EPSG:4326",
+            transform=from_origin(0, 1, 1, 1),
+        )
+        postprocess.clip_extent(source, mask, output)
+    elif operation == "geojson":
+        boundary = tmp_path / "boundary.geojson"
+        boundary.write_text(json.dumps(polygon(0, 0, 3, 1)))
+        postprocess.clip_geojson(source, boundary, output)
+    else:
+        postprocess.transfer_labels(source, output)
+    with rasterio.open(output) as result:
+        expected_values = [
+            [0, 0 if operation == "extract" else 11 if operation == "labels" else 1, 0]
+        ]
+        expected_mask = [[255, 0 if operation == "extract" else 255, 0]]
+        np.testing.assert_array_equal(result.read(1), expected_values)
+        np.testing.assert_array_equal(result.read_masks(1), expected_mask)
+        assert result.nodata == nodata
+
+
+@pytest.mark.parametrize("nodata", [None, 0])
+def test_mosaic_preserves_valid_zero_first_priority_and_invalid_gaps(tmp_path, nodata):
+    first = write_raster(
+        tmp_path / "first.tif",
+        np.array([[0, 300, 2]], dtype="uint16"),
+        nodata=nodata,
+        mask=[[255, 255, 0]],
+    )
+    second = write_raster(
+        tmp_path / "second.tif", np.full((1, 3), 400, dtype="uint16"), nodata=nodata
+    )
+    third = write_raster(
+        tmp_path / "third.tif",
+        np.array([[500]], dtype="uint16"),
+        nodata=nodata,
+        transform=from_origin(150, 200, 10, 10),
+    )
+    output = tmp_path / "mosaic.tif"
+    postprocess.merge_extents([first, second, third], output)
+    with rasterio.open(output) as result:
+        np.testing.assert_array_equal(result.read(1), [[0, 300, 400, 0, 0, 500]])
+        np.testing.assert_array_equal(result.read_masks(1), [[255, 255, 255, 0, 0, 255]])
+        assert result.nodata == nodata
+        assert result.dtypes == ("uint16",)
+        assert result.transform == from_origin(100, 200, 10, 10)
+
+
+def test_mosaic_handles_multiple_windows_and_tiles_above_and_left(tmp_path, monkeypatch):
+    monkeypatch.setattr(postprocess, "WINDOW_SIZE", 16)
+    first = write_raster(tmp_path / "first.tif", np.full((18, 19), 300, dtype="uint16"))
+    second = write_raster(
+        tmp_path / "second.tif",
+        np.full((18, 19), 400, dtype="uint16"),
+        transform=from_origin(90, 210, 10, 10),
+    )
+    output = tmp_path / "mosaic.tif"
+    postprocess.merge_extents([first, second], output)
+    expected = np.zeros((19, 20), dtype="uint16")
+    expected[:18, :19] = 400
+    expected[1:, 1:] = 300
+    with rasterio.open(output) as result:
+        np.testing.assert_array_equal(result.read(1), expected)
+        np.testing.assert_array_equal(result.read_masks(1) != 0, expected != 0)
+        assert result.transform == from_origin(90, 210, 10, 10)

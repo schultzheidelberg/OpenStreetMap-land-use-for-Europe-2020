@@ -48,6 +48,25 @@ class CenterPredictor:
         return np.eye(13, dtype=np.float32)[labels]
 
 
+def test_native_batch_prediction_preserves_patch_bound_and_labels(tmp_path):
+    source, output = tmp_path / "source.tif", tmp_path / "classes.tif"
+    values = np.stack([np.arange(1, 13).reshape(3, 4)] * 2)
+    write_raster(source, values)
+
+    class BatchPredictor(CenterPredictor):
+        def predict_on_batch(self, patches):
+            return super().predict(patches)
+
+        def predict(self, patches, verbose=0):
+            pytest.fail("Native batch predictors should not rebuild predict iterators")
+
+    model = BatchPredictor()
+    classify_raster(source, output, model, batch_size=3, window_size=2)
+    with rasterio.open(output) as result:
+        np.testing.assert_array_equal(result.read(1), values[0])
+    assert model.batches and all(len(batch) <= 3 for batch in model.batches)
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_windowed_prediction_alignment_masks_and_metadata(tmp_path, legacy):
     source, output = tmp_path / "source.TIFF", tmp_path / "classes.tif"

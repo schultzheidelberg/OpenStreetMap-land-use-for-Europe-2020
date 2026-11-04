@@ -137,6 +137,9 @@ def _training_arguments(tmp_path, **changes):
         learning_rate=0.01,
         depth=29,
         overwrite=False,
+        allow_legacy_pickle=False,
+        seed=42,
+        learning_rate_schedule=False,
     )
     arguments.update(changes)
     return SimpleNamespace(**arguments)
@@ -160,3 +163,117 @@ def test_training_rejects_same_data_under_all_paths(tmp_path, alias):
         os.link(train, validation)
     with pytest.raises(ValueError, match="Training and validation files must differ"):
         _training_module().train_model(_training_arguments(tmp_path, validation=validation))
+
+
+def _stub_training_backend(monkeypatch, training, weights, scores):
+    """Exercise publication without importing or training a TensorFlow model."""
+
+    class Model:
+        def __init__(self):
+            self.weights = [SimpleNamespace(numpy=lambda: weights)]
+            self.predict_calls = 0
+
+        def compile(self, **kwargs):
+            pass
+
+        def summary(self):
+            pass
+
+        def fit(self, *args, callbacks, **kwargs):
+            Path(callbacks[0].filepath).write_bytes(b"temporary checkpoint")
+
+        def predict(self, *args, **kwargs):
+            self.predict_calls += 1
+            return scores
+
+        def save(self, path):
+            Path(path).write_bytes(b"published model")
+
+    model = Model()
+    keras = SimpleNamespace(
+        utils=SimpleNamespace(
+            set_random_seed=lambda seed: None,
+            to_categorical=lambda labels, classes: np.eye(classes)[labels],
+        ),
+        optimizers=SimpleNamespace(Nadam=lambda **kwargs: None),
+        callbacks=SimpleNamespace(
+            ModelCheckpoint=lambda filepath, **kwargs: SimpleNamespace(filepath=filepath)
+        ),
+        models=SimpleNamespace(load_model=lambda *args, **kwargs: model),
+    )
+    tensorflow = SimpleNamespace(
+        keras=keras,
+        config=SimpleNamespace(
+            threading=SimpleNamespace(
+                set_inter_op_parallelism_threads=lambda count: None,
+                set_intra_op_parallelism_threads=lambda count: None,
+            )
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "tensorflow", tensorflow)
+    monkeypatch.setattr(training, "resnet_v2", lambda *args, **kwargs: model)
+    return model
+
+
+@pytest.mark.parametrize("existing_output", [False, True])
+@pytest.mark.parametrize(
+    "weights,scores,error",
+    [
+        (np.array([np.nan]), np.ones((2, 13)), "non-finite weights"),
+        (np.array([np.inf]), np.ones((2, 13)), "non-finite weights"),
+        (np.array([-np.inf]), np.ones((2, 13)), "non-finite weights"),
+        (np.ones(1), np.full((2, 13), np.nan), "finite validation scores"),
+        (np.ones(1), np.full((2, 13), np.inf), "finite validation scores"),
+        (np.ones(1), np.ones((2, 12)), "finite validation scores"),
+        (np.ones(1), np.ones((1, 13)), "finite validation scores"),
+    ],
+)
+def test_invalid_checkpoint_never_publishes(
+    tmp_path, monkeypatch, existing_output, weights, scores, error
+):
+    training = _training_module()
+    model = _stub_training_backend(monkeypatch, training, weights, scores)
+    args = _training_arguments(tmp_path, overwrite=existing_output)
+    for path in [args.train, args.validation]:
+        np.savez(path, patches=np.ones((2, 12, 12, 1)), labels=[1, 2])
+    if existing_output:
+        args.output_model.write_bytes(b"previous model")
+    expected_paths = set(tmp_path.iterdir())
+    with pytest.raises(ValueError, match=error):
+        training.train_model(args)
+    if existing_output:
+        assert args.output_model.read_bytes() == b"previous model"
+    else:
+        assert not args.output_model.exists()
+    assert set(tmp_path.iterdir()) == expected_paths
+    if "weights" in error:
+        assert model.predict_calls == 0
+
+
+@pytest.mark.parametrize("suffix", [".KERAS", ".H5", ".Keras", ".hdf5", ""])
+def test_training_rejects_unsupported_model_suffix_before_data_loading(
+    tmp_path, monkeypatch, suffix
+):
+    training = _training_module()
+
+    def unexpected_load(*args, **kwargs):
+        pytest.fail("Unsupported model suffix must fail before loading samples")
+
+    monkeypatch.setattr(training, "load_samples", unexpected_load)
+    with pytest.raises(ValueError, match="lowercase .keras or .h5"):
+        training.train_model(
+            _training_arguments(tmp_path, output_model=tmp_path / f"model{suffix}")
+        )
+
+
+@pytest.mark.parametrize("suffix", [".keras", ".h5"])
+def test_training_publishes_supported_model_suffixes(tmp_path, monkeypatch, suffix):
+    training = _training_module()
+    _stub_training_backend(monkeypatch, training, np.ones(1), np.eye(13)[[1, 2]])
+    args = _training_arguments(tmp_path, output_model=tmp_path / f"model{suffix}")
+    for path in [args.train, args.validation]:
+        np.savez(path, patches=np.ones((2, 12, 12, 1)), labels=[1, 2])
+    metrics = training.train_model(args)
+    assert args.output_model.read_bytes() == b"published model"
+    assert metrics["accuracy"] == 1
+    assert not list(tmp_path.glob("osm4eo-training-*"))
