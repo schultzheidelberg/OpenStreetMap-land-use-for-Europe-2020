@@ -1,0 +1,3 @@
+# GDAL Python bindings are installed separately to match the native GDAL library.
+numpy>=1.24,<2
+rasterio>=1.4,<1.5

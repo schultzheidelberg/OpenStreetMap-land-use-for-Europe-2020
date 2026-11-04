@@ -1,0 +1,2 @@
+# Optional, only for shp_to_lulc.py; use a native psycopg2 build if required by your deployment.
+psycopg2-binary>=2.9,<3

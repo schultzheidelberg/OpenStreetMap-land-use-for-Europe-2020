@@ -1,333 +1,235 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Feb 21 17:41:03 2019
+"""Export OSM land-use polygons for WGS84 shapefile extents from PostGIS.
 
-@author: Janek
+Connection settings come from libpq's PG* environment variables or a service file.
+Importing this module never opens a database connection or prompts for input.
 """
-# import necessary libraries
-# gdal and psycopg2 libraries need to be installed for this script to work
-import sys
-import os, glob
-import ogr,osr
-import psycopg2 as pg
-import time, datetime
-# for logging progress
-from functools import wraps
+
+import argparse
 import logging
-import traceback
+import math
+import os
+import tempfile
+from pathlib import Path
 
-def log(f):
-    @wraps(f)
-    # decoration function which will enhance following function with some info about them
-    def wrapper(*args, **kwds):
+LOGGER = logging.getLogger(__name__)
 
-        # set logger level
-        logger = logging.getLogger()
-        logger.setLevel(logging.INFO)
-        # configure handler (console)
-        consoleHandler = logging.StreamHandler()
-        consoleHandler.setLevel(logging.INFO)
-        
-        # remove previous handlers
-        if (logger.hasHandlers()):
-            logger.handlers.clear()
-            
-        # add handler    
-        logger.addHandler(consoleHandler)
-        
-        # set logging format
-        formatter = logging.Formatter("%(asctime)-15s %(levelname)s - %(message)s")
-        consoleHandler.setFormatter(formatter)
-                
-        start, stop = 0, 0
-        ret = False
+# Preserve the original project's OSM taxonomy (including coastal wetlands).
+OSM_CLASSES = {
+    "urban_fabric": ("1.1", ("garages", "residential")),
+    "indu_comm": (
+        "1.2",
+        ("railway", "industrial", "commercial", "retail", "harbour", "port", "lock", "marina"),
+    ),
+    "mine_dump": ("1.3", ("quarry", "construction", "landfill", "brownfield")),
+    "artificial_veg": (
+        "1.4",
+        (
+            "stadium",
+            "recreation_ground",
+            "golf_course",
+            "sports_center",
+            "playground",
+            "pitch",
+            "village_green",
+            "allotments",
+            "cemetery",
+            "park",
+            "zoo",
+            "track",
+            "garden",
+            "raceway",
+        ),
+    ),
+    "arable_land": (
+        "2.1",
+        ("greenhouse_horticulture", "greenhouse", "farmland", "farm", "farmyard"),
+    ),
+    "permanent_crops": ("2.2", ("vineyard", "orchard")),
+    "pastures": ("2.3", ("meadow",)),
+    "forests": ("3.1", ("forest", "wood")),
+    "shrub": ("3.2", ("grass", "greenfield", "scrub", "heath", "grassland")),
+    "open_spaces": ("3.3", ("cliff", "fell", "sand", "scree", "beach", "mud", "glacier", "rock")),
+    "inland_wetlands": ("4.1", ("marsh", "wetland")),
+    "costal_wetland": ("4.2", ("salt_pond", "tidal")),
+    "water_bodies": ("5.0", ("water", "riverbank", "reservoir", "basin", "dock", "canal", "pond")),
+}
+TYPE_TO_CLASS = {
+    osm_type: class_name
+    for class_name, (_, osm_types) in OSM_CLASSES.items()
+    for osm_type in osm_types
+}
 
-        
-        if logger:
-            start = time.time()
-            logger.info("Enterning {method}()".format(method=f.__name__))
+# Clip intersecting polygons instead of silently dropping polygons crossing a tile.
+QUERY = """
+WITH bounds AS (
+    SELECT ST_Transform(ST_MakeEnvelope(%s, %s, %s, %s, 4326), 3857) AS geom
+)
+SELECT ST_AsBinary(ST_Multi(ST_CollectionExtract(
+           ST_Intersection(nat.the_geom, bounds.geom), 3))), nat.type
+FROM public.naturals AS nat CROSS JOIN bounds
+WHERE ST_Intersects(nat.the_geom, bounds.geom) AND nat.type = ANY(%s)
+"""
 
-        try:
-            ret = f(*args, **kwds)
 
-        except Exception:
-            if logger:
-                error = traceback.format_exc()
-                for line in error.split("\n"):
-                    logger.error(line)
-
-        if logger:
-            stop = time.time()
-            logger.info(
-                "Leaving {method}(), elapsed time {elapsed_time}".format(
-                    method=f.__name__,
-                    elapsed_time=datetime.timedelta(
-                        milliseconds=(stop-start)*1000)
-                )
+def iter_bbox(minX, minY, maxX, maxY, size=4.0):
+    """Yield query boxes incrementally, without gaps or zero-area cells."""
+    values = (minX, minY, maxX, maxY, size)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Bounding box coordinates and size must be finite")
+    if size <= 0 or minX >= maxX or minY >= maxY:
+        raise ValueError("Bounding box must have positive area and size must be positive")
+    nx = math.ceil((maxX - minX) / size)
+    ny = math.ceil((maxY - minY) / size)
+    for x in range(nx):
+        for y in range(ny):
+            yield (
+                minX + x * size,
+                minY + y * size,
+                min(minX + (x + 1) * size, maxX),
+                min(minY + (y + 1) * size, maxY),
             )
-        return ret
 
-    return wrapper
 
-class config(object):
-   def __init__(self): 
-       self.root_dir = os.path.dirname(__file__)
-       self.shp_dir  = input("Please specify the location/folder of the Shapefile(s): ")
+def split_bbox(minX, minY, maxX, maxY, size=4.0):
+    """Compatibility helper for callers needing a list; the exporter streams boxes."""
+    return list(iter_bbox(minX, minY, maxX, maxY, size))
 
-       if os.path.exists(self.shp_dir):
-          os.chdir(str(self.shp_dir))
-          print ("Sucessfully changed working directory to {f}".format(f=self.shp_dir))     
-       else:
-          print ("Could not navigate to {f}. Script could not be executed.".format(f=self.shp_dir))
-          sys.exit(0)   
 
-       if len(glob.glob("*.shp")) == 0:
-          print ("No Shapefile(s) found in {folder}. Script could not be executed.".format(folder=os.getcwd())) 
-          sys.exit()
+def iter_extents(shapefiles, tile_size=4.0):
+    """Yield unique names and WGS84 boxes, with no process-wide directory changes."""
+    from osgeo import ogr, osr
 
-       self.bboxes = []
-       self.filenames = []
-       self.db_con = None
-       self.cursor = None
-      
-       for f in (self.get_extent, self.pg_connect, self.sql_query):
-          ret = f()
-          if not ret:
-             print("A module of the script could not be executed.")
-             sys.exit(0)
-             
-       print ("Resulting LULC-shp file(s) saved under:{outpath}".format(outpath=self.root_dir + '/results/'))
-
-   @log 
-   def get_extent(self):
-         ret = False  
-         try:
-            driver = ogr.GetDriverByName('ESRI Shapefile')
-            # get all shapefiles in folder       
-            for shp_file in glob.glob("*.shp"):
-               index = 0
-               filename = "feature_"
-               shapefile = driver.Open(shp_file)
-               layer = shapefile.GetLayer()
-
-               # check coordinate system
-               srs = layer.GetSpatialRef()      
-               if srs.GetAttrValue("AUTHORITY", 1) != '4326':
-                  print('Projection of the Shapefile {shp} should be WGS84.'.format(shp=shp_file))
-                  return
-
-               # get all features of each shapefile in folder
-               feature_counter = layer.GetFeatureCount()
-               for i in range(feature_counter):
-                  index += 1
-                  feature = layer.GetFeature(i)
-                  # get the extent of the first feature
-                  extent = feature.GetGeometryRef().GetEnvelope()
-                  minX, maxX, minY, maxY = extent
-                  # get area of each feature
-                  area = feature.GetGeometryRef().GetArea()
-                  # bounding boxes are split into smaller one for bigger areas (bigger than about 1000km² - adjust this values if errors occur)
-                  if area > 50:
-                     new_bboxes = split_bbox(minX ,minY ,maxX ,maxY)
-                     for i in range (len(new_bboxes)):
-                        self.bboxes.append(new_bboxes[i])
-                        self.filenames.append(filename + str(index) + '_extract_' + str(i+1))
-                  # collect extents of smaller bboxes
-                  else:
-                     self.bboxes.append((minX, minY, maxX, maxY))
-                     self.filenames.append(filename + str(index))
-
-               shapefile = None
-
-            ret = True
-
-         except:
-            print("Could not retrieve the bbox from the shapefile.")
- 
-         return ret
-
-   @log
-   def pg_connect(self):
-        ret = False     
+    expected = osr.SpatialReference()
+    expected.ImportFromEPSG(4326)
+    expected.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    for path in shapefiles:
+        dataset = ogr.Open(str(path))
+        if dataset is None:
+            raise ValueError(f"Cannot open shapefile: {path}")
         try:
-           self.db_con = pg.connect(dbname="osm_hstore", user="osmuserread", password="ASKFROMMICHEL", host="osmosis.geog.uni-heidelberg.de", port="5432")
-           self.cursor = self.db_con.cursor()
-           ret = True
-        
-        except:
-            print("Could not connect to database. Make sure the parameters are correct")
-        
-        return ret
+            layer = dataset.GetLayer()
+            crs = layer.GetSpatialRef()
+            if crs is None:
+                raise ValueError(f"Missing CRS: {path}")
+            crs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            if not crs.IsSame(expected):
+                raise ValueError(f"Input must use EPSG:4326: {path}")
+            for index, feature in enumerate(layer, start=1):
+                geometry = feature.GetGeometryRef()
+                if geometry is None or geometry.IsEmpty():
+                    raise ValueError(f"Empty geometry in {path}, feature {index}")
+                left, right, bottom, top = geometry.GetEnvelope()
+                for tile, box in enumerate(iter_bbox(left, bottom, right, top, tile_size), start=1):
+                    yield f"{Path(path).stem}_feature_{index}_tile_{tile}", box
+        finally:
+            dataset = None
 
-   @log  
-   def sql_query(self):
-      ret = False
-      try:
-         
-         # store results in folder
-         if not os.path.exists(self.root_dir + '/results/'):
-                os.makedirs(self.root_dir + '/results/')
-         os.chdir(self.root_dir + '/results/')
-         
-         index = 0
-         # for each bbox a query is executed
-         for box in self.bboxes:
-            
-     
-            query = '''
-            SELECT
-     	CASE
-     		WHEN 
-     			nat.the_geom && st_transform(st_makeenvelope({x},{y},{xx},{yy}, 4326),3857)-- a && b : a and b's bbox intersect
-     			AND
-     			nat.the_geom @  st_transform(st_makeenvelope({x},{y},{xx},{yy}, 4326),3857) -- a @ b : a completly contained by b
-     		THEN ST_AsText(nat.the_geom)
-     	END as the_geom,
-        CASE 
-			WHEN type IN ('garages', 'residential') THEN 'urban_fabric'
-			WHEN type IN ('railway', 'industrial', 'commercial', 'retail', 'harbour', 'port', 'lock', 'marina') THEN 'indu_comm'
-			WHEN type IN ('quarry', 'construction', 'landfill', 'brownfield') THEN 'mine_dump'
-			WHEN type IN ('stadium', 'recreation_ground', 'golf_course', 'sports_center', 'playground', 'pitch', 'village_green', 'allotments', 'cemetery', 'park', 'zoo', 'track', 'garden', 'raceway') THEN 'artificial_veg'
-			WHEN type IN ('greenhouse_horticulture', 'greenhouse', 'farmland', 'farm', 'farmyard') THEN 'arable_land'
-            WHEN type IN ('vineyard', 'orchard') THEN 'permanent_crops'
-			WHEN type = 'meadow' THEN 'pastures'
-			WHEN type IN ('forest', 'wood') THEN 'forests'
-			WHEN type IN ('grass', 'greenfield', 'scrub', 'heath', 'grassland') THEN 'shrub'
-			WHEN type IN ('cliff', 'fell', 'sand', 'scree', 'beach', 'mud', 'glacier', 'rock') THEN 'open_spaces'
-			WHEN type IN ('marsh', 'wetland') THEN 'inland_wetlands'
-			WHEN type IN ('salt_pond', 'tidal') THEN 'costal_wetland'
-			WHEN type IN ('water', 'riverbank', 'reservoir', 'basin', 'dock', 'canal', 'pond') THEN 'water_bodies'
-        END as class
-  FROM public.naturals as nat
- WHERE ST_Intersects(nat.the_geom, st_transform(st_makeenvelope({x},{y},{xx},{yy}, 4326),3857)) AND type in ('garages', 'residential','railway', 'industrial', 'commercial', 'retail', 'harbour', 'port', 'lock', 'marina','quarry', 'construction', 'landfill', 'brownfield','stadium', 'recreation_ground', 'golf_course', 'sports_center', 'playground', 'pitch', 'village_green', 'allotments', 'cemetery', 'park', 'zoo', 'track', 'garden', 'raceway','greenhouse_horticulture', 'greenhouse', 'farmland', 'farm', 'farmyard','vineyard', 'orchard','meadow','forest', 'wood','grass', 'greenfield', 'scrub', 'heath', 'grassland','cliff', 'fell', 'sand', 'scree', 'beach', 'mud', 'glacier', 'rock','marsh', 'wetland','salt_pond', 'tidal','water', 'riverbank', 'reservoir', 'basin', 'dock', 'canal', 'pond')
-'''.format(x = box[0], y = box[1], xx= box[2], yy = box[3])
 
-            self.cursor.execute(query)
-            obj = self.cursor.fetchall()
-            file = self.filenames[index]
-            
-            # execute another function for the export
-            self.export_to_shape(obj,file)     
-            index += 1      
-            print (file + " done")            
-                
-         # close connection when done
-         self.cursor.close() 
-         self.db_con.close()
-         os.chdir(self.root_dir)
-         
-         ret = True
-      except:
-         print ("Query is too large to fetch locally. Try using server sides cursors or reduce the bbox")
-      return ret
-   
-   @log
-   def export_to_shape(self, query_object, filename):
-      try:
-         # Create the output Driver
-         outDriver = ogr.GetDriverByName('ESRI Shapefile')
-   
-         # define projection
-         proj = osr.SpatialReference()
-         proj.ImportFromEPSG(3857)
-   
-         # create shp file
-         outputshp = "{path}/results/{file}.shp".format(path=self.root_dir, file=filename)
-         
+def export_to_shape(rows, output):
+    """Stream database rows to a temporary shapefile; preserve existing outputs."""
+    from osgeo import ogr, osr
 
-         if os.path.exists(outputshp):
-            outDriver.DeleteDataSource(outputshp)
-         outDataSet = outDriver.CreateDataSource(outputshp)
-         outLayer = outDataSet.CreateLayer(filename, proj, ogr.wkbPolygon)
-         
-         # create field
-         field_definition = ogr.FieldDefn("class", ogr.OFTString)
-         field_definition.SetWidth(24)
-         outLayer.CreateField(field_definition)
-         
-         # create second field
-         field_definition2 = ogr.FieldDefn("code", ogr.OFTString)
-         field_definition2.SetWidth(4)
-         outLayer.CreateField(field_definition2)         
-         
-         # iterate through lines of the query 
-         for line in query_object:
-            if line[0] == None: # if empty geom -> pass this line
-               continue
-            # create the feature
-            feature = ogr.Feature(outLayer.GetLayerDefn())
-            # set the field values
-            feature.SetField("class", line[1])
-            
-            # add class code to second field
-            if line[1] == "urban_fabric":
-               feature.SetField("code","1.1")
-            if line[1] == "indu_comm":
-               feature.SetField("code","1.2")
-            if line[1] == "mine_dump":
-               feature.SetField("code","1.3")
-            if line[1] == "artificial_veg":
-               feature.SetField("code","1.4")
-            if line[1] == "arable_land":
-               feature.SetField("code","2.1")
-            if line[1] == "permanent_crops":
-               feature.SetField("code","2.2")
-            if line[1] == "pastures":
-               feature.SetField("code","2.3")
-            if line[1] == "forests":
-               feature.SetField("code","3.1")
-            if line[1] == "shrub":
-               feature.SetField("code","3.2")
-            if line[1] == "open_spaces":
-               feature.SetField("code","3.3")
-            if line[1] == "inland_wetlands":
-               feature.SetField("code","4.1")
-            if line[1] == "costal_wetland":
-               feature.SetField("code","4.2")
-            if line[1] == "water_bodies":
-               feature.SetField("code","5.0")
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if any(output.parent.glob(output.stem + ".*")):
+        raise FileExistsError(f"Output or sidecar already exists: {output}")
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    crs = osr.SpatialReference()
+    crs.ImportFromEPSG(3857)
+    count = 0
+    with tempfile.TemporaryDirectory(prefix=".osm-export-", dir=output.parent) as scratch:
+        temporary = Path(scratch) / output.name
+        dataset = driver.CreateDataSource(str(temporary))
+        if dataset is None:
+            raise RuntimeError(f"Cannot create shapefile: {temporary}")
+        try:
+            layer = dataset.CreateLayer(output.stem, crs, ogr.wkbMultiPolygon)
+            if layer is None:
+                raise RuntimeError("Cannot create output layer")
+            for name, width in (("class", 24), ("code", 4)):
+                field = ogr.FieldDefn(name, ogr.OFTString)
+                field.SetWidth(width)
+                if layer.CreateField(field) != 0:
+                    raise RuntimeError(f"Cannot create field {name}")
+            for wkb, osm_type in rows:
+                if wkb is None:
+                    continue
+                geometry = ogr.CreateGeometryFromWkb(bytes(wkb))
+                if geometry is None:
+                    raise ValueError("Database returned an invalid geometry")
+                if geometry.IsEmpty():
+                    continue
+                class_name = TYPE_TO_CLASS[osm_type]
+                feature = ogr.Feature(layer.GetLayerDefn())
+                feature.SetField("class", class_name)
+                feature.SetField("code", OSM_CLASSES[class_name][0])
+                feature.SetGeometry(geometry)
+                if layer.CreateFeature(feature) != 0:
+                    raise RuntimeError("Cannot write output feature")
+                count += 1
+        finally:
+            dataset = None
+        # Shapefiles have multiple sidecars: publish only after writing succeeds.
+        # Link creation refuses concurrent replacement; rollback only our new links.
+        published = []
+        try:
+            for part in sorted(Path(scratch).iterdir()):
+                destination = output.parent / part.name
+                os.link(part, destination)
+                published.append(destination)
+        except BaseException:
+            for destination in published:
+                destination.unlink()
+            raise
+    return count
 
-            # add geometry
-            feature.SetGeometry(ogr.CreateGeometryFromWkt(line[0]))        
-            outLayer.CreateFeature(feature)
-            # close everything
-            del feature       
-         del outDataSet         
-      except:
-         print ("Could not write Shapefile of file {file}".format(file=filename))
 
-def split_bbox(minX, minY, maxX, maxY):
-   # the initial extent/bbox of a feature is split into smaller bounding boxes with the size of x degrees (WGS84).
-   # The shift is performed n times, depending on its width and height
-   # width and height, repectively divided by x and converted to integer value results in n. 
-   # +1 is added to width and height to ensure to include the complete bbox (otherwise a gap would be left over) 
-   bboxes = []
-   size = int(4) # size of extracts in both x and y dimension (in degrees)
-   
-   numberx = int(((int(maxX)-int(minX))/size)) + 1
-   numbery = int(((int(maxY)-int(minY))/size)) + 1
-   extracts = numberx * numbery
-   print ("The BBox of a feature inside a shapefile is too big to process as a whole. It is now split into {extracts} extracts/files.".format(extracts=extracts))
-   print ("Please wait...")
+def export_extents(connection, extents, output_dir, batch_size=1000):
+    """Use a server-side cursor so result sets are not loaded with fetchall()."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    results = []
+    for index, (name, box) in enumerate(extents):
+        output = Path(output_dir) / f"{name}.shp"
+        with connection.cursor(name=f"osm_export_{index}") as cursor:
+            cursor.itersize = batch_size
+            cursor.execute(QUERY, (*box, list(TYPE_TO_CLASS)))
+            count = export_to_shape(cursor, output)
+        LOGGER.info("Wrote %s (%d polygons)", output, count)
+        results.append(output)
+    return results
 
-   minx_2 = minX # the initial minimum x value is set to the minimum x values of the complete feature
-   for x in range(numberx):
-      miny_2 = minY # initial minimum y value is set to the minimum y value of the complete feature
-      maxx_2 = minx_2 + size 
-      for y in range(numbery):
-         maxy_2 = miny_2 + size
-         if maxx_2 > maxX: # if a width value exceeds the initial bbox maximum x-Value, it is trimmed to x-max (this happens in the last run of the loop due to the +1 in n+1)
-            maxx_2 = maxX
-         if maxy_2 > maxY: # the height value is treated in the same fashion
-            maxy_2 = maxY
-         bboxes.append((minx_2,miny_2,maxx_2,maxy_2))
-         miny_2 += size
-      minx_2 += size
 
-   return bboxes
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input_dir", type=Path, help="Directory containing WGS84 .shp files")
+    parser.add_argument("output_dir", type=Path, help="Destination for EPSG:3857 shapefiles")
+    parser.add_argument(
+        "--tile-size", type=float, default=4.0, help="Maximum query extent in degrees (default: 4)"
+    )
+    parser.add_argument("--batch-size", type=int, default=1000, help="Rows fetched at a time")
+    args = parser.parse_args(argv)
+    if args.tile_size <= 0 or not math.isfinite(args.tile_size) or args.batch_size < 1:
+        parser.error("tile-size and batch-size must be positive and finite")
+    shapefiles = sorted(args.input_dir.glob("*.shp"))
+    if not shapefiles:
+        parser.error(f"No .shp files in {args.input_dir}")
+    import psycopg2
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    connection = psycopg2.connect("")
+    try:
+        with connection:
+            export_extents(
+                connection,
+                iter_extents(shapefiles, args.tile_size),
+                args.output_dir,
+                args.batch_size,
+            )
+    finally:
+        connection.close()
+    return 0
+
 
 if __name__ == "__main__":
-   starttime = time.time()
-   config() 
-   endtime = time.time()
-   print("Elapsed time {elapsed_time}".format(elapsed_time=datetime.timedelta(milliseconds=(endtime-starttime)*1000)))     
+    raise SystemExit(main())
